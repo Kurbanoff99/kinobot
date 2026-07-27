@@ -151,10 +151,9 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, auto_add_movie))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kino_yuboruvchi))
 
-    if SERVER_URL:
-        application.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, webhook_url=f"{SERVER_URL}/{TOKEN}")
-    else:
-        application.run_polling()
+    # PORT va SERVER_URL shart emas, oddiy polling rejimida ishga tushiramiz
+    application.run_polling()
+
 
 if __name__ == "__main__":
     main()
