@@ -8,3 +8,5 @@ cachetools>=5.2.0
 APScheduler>=3.9.1
 pytz>=2018.6
 aiohttp>=3.8.4
+fastapi
+uvicorn
