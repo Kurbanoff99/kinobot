@@ -141,8 +141,10 @@ async def kino_yuboruvchi(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("🔍 Bunday kodli kino topilmadi. Kodni to'g'ri yozganingizni tekshiring.")
 
 def main() -> None:
+    # Telegram ilovasini yaratish
     application = Application.builder().token(TOKEN).build()
 
+    # Handlerlarni ro'yxatdan o'tkazish
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stat", admin_stat))
     application.add_handler(CommandHandler("del", admin_delete_movie))
@@ -151,9 +153,19 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, auto_add_movie))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kino_yuboruvchi))
 
-    # PORT va SERVER_URL shart emas, oddiy polling rejimida ishga tushiramiz
-    application.run_polling()
-
+    # Render talab qilgan port xatosini tuzatish (Webhook orqali ishga tushirish)
+    if SERVER_URL:
+        # Render standart porti 10000 yoki o'zgaruvchidan olinadi
+        render_port = int(os.environ.get('PORT', 10000)) 
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=render_port,
+            url_path=TOKEN,
+            webhook_url=f"{SERVER_URL}/{TOKEN}"
+        )
+    else:
+        # Mahalliy kompyuterda tekshirish uchun polling
+        application.run_polling()
 
 if __name__ == "__main__":
     main()
