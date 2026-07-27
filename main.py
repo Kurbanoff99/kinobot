@@ -1,155 +1,90 @@
-import uuid
-import telegram
-from telegram.constants import ChatAction
-from utils import *
-import logging
 import os
-import requests
-from web_scrappers.netnaija import netnaija_web_scrapper
-from web_scrappers.tfpdl import tfpdl
-from web_scrappers.torrent_1337x import search_torrent1337x
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
+import logging
+from telegram import Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
-    ApplicationHandlerStop,
     CommandHandler,
-    InvalidCallbackData,
-    ContextTypes,
-    ConversationHandler,
     MessageHandler,
-    filters
+    filters,
+    ContextTypes,
+    ApplicationHandlerStop
 )
 
-# .env yoki Server Environment Variables'dan ma'lumotlarni olish
+# .env yoki Server Environment Variables'dan yuklanadigan ma'lumotlar
 TOKEN = os.environ.get('TOKEN')
-api_key = os.environ.get('tmdbApiKey')
-KANAL_ID = os.environ.get('KANAL_ID')
+BAZA_KANAL_ID = int(os.environ.get('BAZA_KANAL_ID', '0'))  # ID raqam bo'lgani uchun int() qilamiz
+MAJBURIY_KANAL_ID = os.environ.get('MAJBURIY_KANAL_ID')    # Masalan: @mening_kanalim
 ADMIN_ID = os.environ.get('ADMIN_ID')
 PORT = int(os.environ.get('PORT', '8443'))
-SERVER_URL = os.environ.get('SERVER_URL') # Masalan: https://onrender.com
+SERVER_URL = os.environ.get('SERVER_URL')                  # Masalan: https://onrender.com
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-ResultsCache = {}
-ResultsPerPage = 1
-LinksCache = {}
+# Kinolar va ularning kanaldagi Message ID (Xabar raqami) lug'ati
+# Yangi kino yuklaganingizda ushbu ro'yxatga kod va xabar ID-sini qo'shib borasiz
+KINO_BAZASI = {
+    "kino1": 45,
+    "kino2": 46,
+    "avatar": 52,
+    "rembo": 60
+}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if str(update.effective_user.id) == str(ADMIN_ID):
-        await update.message.reply_text('Xush kelibsiz, Admin!')
-    await update.message.reply_text('Welcome To Terader Movie Hub! Send me a movie name.')
+    user_id = update.effective_user.id
+    if str(user_id) == str(ADMIN_ID):
+        await update.message.reply_text('Xush kelibsiz, Admin! 🛠\nYangi kinolarni KINO_BAZASI ro‘yxatiga qo‘shib qo‘yishni unutmang.')
+    
+    await update.message.reply_text(
+        "Salom! Kinolarni yuklab olish uchun kino kodini yuboring.\n"
+        "Masalan: kino1 yoki avatar"
+    )
 
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Kanalga a'zolikni tekshirish"""
-    if not KANAL_ID:
+async def check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Majburiy kanalga a'zolikni tekshirish"""
+    if not MAJBURIY_KANAL_ID:
         return
+    
     try:
-        chat = await context.bot.get_chat_member(user_id=update.effective_user.id, chat_id=KANAL_ID)
+        user_id = update.effective_user.id
+        chat = await context.bot.get_chat_member(chat_id=MAJBURIY_KANAL_ID, user_id=user_id)
         if chat.status in ['left', 'kicked']:
-            await update.message.reply_text('Botdan foydalanish uchun kanalimizga a\'zo bo\'ling!')
-            await update.message.reply_text(parse_mode='HTML', text=f'https://t.me{KANAL_ID.replace("@", "")}')
+            await update.message.reply_text(
+                f"⚠️ Botdan foydalanish uchun rasmiy kanalimizga a'zo bo'ling:\n"
+                f"👉 {MAJBURIY_KANAL_ID}"
+            )
             raise ApplicationHandlerStop
     except Exception as e:
         logger.error(f"Kanal tekshirishda xatolik: {e}")
 
-async def handle_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    user_id = query.message.chat_id
+async def kino_yuboruvchi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Foydalanuvchi kod yozganda kinoni maxfiy kanaldan ko'chirib beradi"""
+    await check_membership(update, context)
     
-    try:
-        pagination_id, page = data.split('-')[1].split(':')
-    except ValueError:
-        return
+    kino_kodi = update.message.text.strip().lower()
 
-    if page == "0":
-        return
-
-    cache_key = ResultsCache.get(user_id, None)
-    if cache_key:
-        results = cache_key.get(pagination_id)
-        if not results:
-            await query.answer(text="Message Expired\nPlease resend request", show_alert=True)
-            return
-        pages_length = int(len(results))
-        results = results.get(page)
-        await query.answer()
-    else:
-        await query.answer(text="Message Expired\nPlease resend request", show_alert=True)
-        return
-
-    page = int(page)
-    button_labels = []
-    if page > 1: button_labels.append('<< Prev')
-    button_labels.append(f'🗒 {page}/{pages_length}')
-    if pages_length > page: button_labels.append('Next >>')
-
-    buttons = []
-    for label in button_labels:
-        if label == '<< Prev':
-            buttons.append(InlineKeyboardButton(text=label, callback_data=f'page-{pagination_id}:{page-1}'))
-        elif label == 'Next >>':
-            buttons.append(InlineKeyboardButton(text=label, callback_data=f'page-{pagination_id}:{page+1}'))
-        else:
-            buttons.append(InlineKeyboardButton(text=label, callback_data=f'page-{pagination_id}:0'))
-
-    reply_markup = InlineKeyboardMarkup([buttons])
-    movie_poster_url = f'https://tmdb.org{results["poster_path"]}'
-    file_obj = await get_raw_image(movie_poster_url)
-
-    title_key = 'title' if results.get('title') else 'name'
-    release_date_key = 'release_date' if results.get('title') else 'first_air_date'
-    link_prefix = 'm' if title_key == 'title' else 's'
-    link = f"/{link_prefix}_{results['id']}"
-
-    movie_caption = f"🎬Title: {results[title_key]}\n📃Click to view: {link}\n🔤Language: {results['original_language']}\n🎯Released: {month_converter(results[release_date_key])}\n✅Voted: {results['vote_average']}"
-
-    if file_obj:
-        await update.effective_user.send_chat_action(action=ChatAction.UPLOAD_PHOTO)
+    if kino_kodi in KINO_BAZASI:
+        message_id = KINO_BAZASI[kino_kodi]
         try:
-            await update.effective_message.edit_media(media=InputMediaPhoto(media=file_obj, caption=movie_caption), reply_markup=reply_markup)
-        except telegram.error.BadRequest:
-            pass
+            # Bot kinoni maxfiy kanaldan foydalanuvchiga nusxalab yuboradi
+            await context.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=BAZA_KANAL_ID,
+                message_id=message_id
+            )
+        except Exception as e:
+            logger.error(f"Kinoni yuborishda xatolik: {e}")
+            await update.message.reply_text("❌ Kechirasiz, faylni yuborishda texnik xatolik yuz berdi.")
     else:
-        await update.effective_user.send_chat_action(action=ChatAction.TYPING)
-        await update.effective_message.edit_caption(caption=movie_caption, reply_markup=reply_markup)
-
-async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text
-    if not ('_ ' in text or '_' in text): return
-    category, movie_id = text.split('_')
-    category = "movie" if category == '/m' else "tv"
-
-    req = requests.get(f'https://themoviedb.org{category}/{movie_id}?api_key={api_key}')
-    if req.status_code == 200:
-        req = req.json()
-        movie_poster_url = f'https://tmdb.org{req["poster_path"]}'
-        file_obj = await get_raw_image(movie_poster_url)
-        imdb_link = f'IMDB LINK: https://imdb.com{req["imdb_id"]}\n' if req.get("imdb_id") else ''
-        title_key, release_date_key = get_movie_type(req)
-        
-        caption = f'🎬Title: {req.get(title_key)}\n🎯Released: {req.get(release_date_key)}\nOverview: {req.get("overview")[:200]}\n{imdb_link}Voted: {req.get("vote_average")}\nTagline: {req.get("tagline")}\n'
-        genre = ','.join([items['name'] for items in req.get('genres', [])[:6]])
-
-        if file_obj:
-            await update.effective_user.send_chat_action(action=ChatAction.UPLOAD_PHOTO)
-            await update.effective_message.reply_photo(photo=file_obj, caption=f'{caption} 🎭Genres: {genre}')
-        else:
-            await update.effective_user.send_chat_action(action=ChatAction.TYPING)
-            await update.effective_message.reply_text(text=f'{caption} 🎭Genres: {genre}')
+        await update.message.reply_text("🔍 Bunday kodli kino topilmadi. Kodni to'g'ri yozganingizni tekshiring.")
 
 def main() -> None:
-    """Botni serverda ishga tushirish (Webhook yoki Polling)"""
+    """Botni ishga tushirish (Webhook va Polling rejimi)"""
     application = Application.builder().token(TOKEN).build()
 
-    # Handlerlarni ro'yxatdan o'tkazish
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_pagination, pattern=r"^page-"))
-    application.add_handler(MessageHandler(filters.Regex(r"^/(m|s)_"), movie))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, kino_yuboruvchi))
 
-    # Serverga joylashganda Webhook yoqiladi, localda esa oddiy ishlaydi
     if SERVER_URL:
         application.run_webhook(
             listen="0.0.0.0",
