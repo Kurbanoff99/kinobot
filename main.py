@@ -1,126 +1,164 @@
-import asyncio
-import sqlite3
-import sys
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+import uuid
+import telegram
+from telegram.constants import ChatAction
+from utils import *
+import logging
+import os
+import requests
+from web_scrappers.netnaija import netnaija_web_scrapper
+from web_scrappers.tfpdl import tfpdl
+from web_scrappers.torrent_1337x import search_torrent1337x
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ApplicationHandlerStop,
+    CommandHandler,
+    InvalidCallbackData,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters
+)
 
-# --- ASOSIY SOZLAMALAR ---
-BOT_TOKEN = "8736896110:AAEr98TC0jYGOZlcOOSMG_9CBoCf4R4HErI"
-KANAL_ID = "@kinokodlari_HD"  # Masalan: @topkinokod_kanal
-ADMIN_ID = 8926774561  # O'zingizning Telegram ID raqamingiz (@userinfobot orqali olingan)
+# .env yoki Server Environment Variables'dan ma'lumotlarni olish
+TOKEN = os.environ.get('TOKEN')
+api_key = os.environ.get('tmdbApiKey')
+KANAL_ID = os.environ.get('KANAL_ID')
+ADMIN_ID = os.environ.get('ADMIN_ID')
+PORT = int(os.environ.get('PORT', '8443'))
+SERVER_URL = os.environ.get('SERVER_URL') # Masalan: https://onrender.com
 
-# Botni HTML formatda xabarlar yuboradigan qilib sozlaymiz (Server uchun proxy shart emas)
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+logger = logging.getLogger(__name__)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- MA'LUMOTLAR BAZASI BILAN ISHLASH ---
-def baza_yaratish():
-    conn = sqlite3.connect("kinolar.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS kinolar (
-            kod TEXT PRIMARY KEY,
-            nomi TEXT,
-            link TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+ResultsCache = {}
+ResultsPerPage = 1
+LinksCache = {}
 
-# Kanalga a'zolikni tekshirish funksiyasi
-async def azomi(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=KANAL_ID, user_id=user_id)
-        return member.status in ["creator", "administrator", "member"]
-    except Exception:
-        return False
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if str(update.effective_user.id) == str(ADMIN_ID):
+        await update.message.reply_text('Xush kelibsiz, Admin!')
+    await update.message.reply_text('Welcome To Terader Movie Hub! Send me a movie name.')
 
-# Start buyrug'i kelganda
-@dp.message(CommandStart())
-async def start_cmd(message: types.Message):
-    user_id = message.from_user.id
-    
-    if await azomi(user_id):
-        await message.answer("🍿 <b>Xush kelibsiz!</b> Kino kodini yuboring (Masalan: 101):")
-    else:
-        builder = InlineKeyboardBuilder()
-        builder.button(text="Kanallarga a'zo bo'lish 📢", url=f"https://t.me{KANAL_ID.replace('@', '')}")
-        builder.button(text="Tekshirish ✅", callback_data="check_sub")
-        builder.adjust(1)
-        
-        await message.answer(
-            "<b>Botdan foydalanish uchun homiy kanalimizga a'zo bo'ling! 👇</b>",
-            reply_markup=builder.as_markup()
-        )
-
-# Tekshirish tugmasi bosilganda
-@dp.callback_query(F.data == "check_sub")
-async def check_subscription(callback: types.CallbackQuery):
-    if await azomi(callback.from_user.id):
-        await callback.message.delete()
-        await callback.message.answer("Rahmat! Endi kino kodini yuborishingiz mumkin: 🍿")
-    else:
-        await callback.answer("Siz hali kanalga a'zo bo'lmadingiz! ❌", show_alert=True)
-
-# Admin uchun yeni kino qo'shish buyrug'i
-# Format: /add [kod] [nomi] [link]
-@dp.message(Command("add"))
-async def add_movie(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kanalga a'zolikni tekshirish"""
+    if not KANAL_ID:
         return
-
     try:
-        args = message.text.split(" ", 3)
-        if len(args) < 4:
-            await message.answer("❌ Xatolik! Format: <code>/add kod nomi link_yoki_faylid</code>")
-            return
-            
-        kod = args[1].strip()
-        nomi = args[2].strip()
-        link = args[3].strip()
-        
-        conn = sqlite3.connect("kinolar.db")
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO kinolar VALUES (?, ?, ?)", (kod, nomi, link))
-        conn.commit()
-        conn.close()
-        
-        await message.answer(f"✅ <b>Kino muvaffaqiyatli qo'shildi!</b>\n\n<b>Kod:</b> {kod}\n<b>Nomi:</b> {nomi}")
+        chat = await context.bot.get_chat_member(user_id=update.effective_user.id, chat_id=KANAL_ID)
+        if chat.status in ['left', 'kicked']:
+            await update.message.reply_text('Botdan foydalanish uchun kanalimizga a\'zo bo\'ling!')
+            await update.message.reply_text(parse_mode='HTML', text=f'https://t.me{KANAL_ID.replace("@", "")}')
+            raise ApplicationHandlerStop
     except Exception as e:
-        await message.answer(f"❌ Xatolik yuz berdi: {e}")
+        logger.error(f"Kanal tekshirishda xatolik: {e}")
 
-# Kino kodini qidirish va yuborish
-@dp.message()
-async def send_movie(message: types.Message):
-    user_id = message.from_user.id
+async def handle_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.message.chat_id
     
-    if not await azomi(user_id):
-        await start_cmd(message)
+    try:
+        pagination_id, page = data.split('-')[1].split(':')
+    except ValueError:
         return
 
-    kod = message.text.strip()
-    
-    conn = sqlite3.connect("kinolar.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomi, link FROM kinolar WHERE kod=?", (kod,))
-    natija = cursor.fetchone()
-    conn.close()
-    
-    if natija:
-        nomi, link = natija
-        await message.answer(f"🎬 <b>Kino nomi:</b> {nomi}\n\n🍿 <b>Tomosha qilish:</b> {link}")
-    else:
-        await message.answer("Afsuski, bunday kodli kino topilmadi. Boshqa kod yozib ko'ring. 😔")
+    if page == "0":
+        return
 
-async def main():
-    baza_yaratish()
-    print("Bot muvaffaqiyatli ishga tushdi...")
-    await dp.start_polling(bot)
+    cache_key = ResultsCache.get(user_id, None)
+    if cache_key:
+        results = cache_key.get(pagination_id)
+        if not results:
+            await query.answer(text="Message Expired\nPlease resend request", show_alert=True)
+            return
+        pages_length = int(len(results))
+        results = results.get(page)
+        await query.answer()
+    else:
+        await query.answer(text="Message Expired\nPlease resend request", show_alert=True)
+        return
+
+    page = int(page)
+    button_labels = []
+    if page > 1: button_labels.append('<< Prev')
+    button_labels.append(f'🗒 {page}/{pages_length}')
+    if pages_length > page: button_labels.append('Next >>')
+
+    buttons = []
+    for label in button_labels:
+        if label == '<< Prev':
+            buttons.append(InlineKeyboardButton(text=label, callback_data=f'page-{pagination_id}:{page-1}'))
+        elif label == 'Next >>':
+            buttons.append(InlineKeyboardButton(text=label, callback_data=f'page-{pagination_id}:{page+1}'))
+        else:
+            buttons.append(InlineKeyboardButton(text=label, callback_data=f'page-{pagination_id}:0'))
+
+    reply_markup = InlineKeyboardMarkup([buttons])
+    movie_poster_url = f'https://tmdb.org{results["poster_path"]}'
+    file_obj = await get_raw_image(movie_poster_url)
+
+    title_key = 'title' if results.get('title') else 'name'
+    release_date_key = 'release_date' if results.get('title') else 'first_air_date'
+    link_prefix = 'm' if title_key == 'title' else 's'
+    link = f"/{link_prefix}_{results['id']}"
+
+    movie_caption = f"🎬Title: {results[title_key]}\n📃Click to view: {link}\n🔤Language: {results['original_language']}\n🎯Released: {month_converter(results[release_date_key])}\n✅Voted: {results['vote_average']}"
+
+    if file_obj:
+        await update.effective_user.send_chat_action(action=ChatAction.UPLOAD_PHOTO)
+        try:
+            await update.effective_message.edit_media(media=InputMediaPhoto(media=file_obj, caption=movie_caption), reply_markup=reply_markup)
+        except telegram.error.BadRequest:
+            pass
+    else:
+        await update.effective_user.send_chat_action(action=ChatAction.TYPING)
+        await update.effective_message.edit_caption(caption=movie_caption, reply_markup=reply_markup)
+
+async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.effective_message.text
+    if not ('_ ' in text or '_' in text): return
+    category, movie_id = text.split('_')
+    category = "movie" if category == '/m' else "tv"
+
+    req = requests.get(f'https://themoviedb.org{category}/{movie_id}?api_key={api_key}')
+    if req.status_code == 200:
+        req = req.json()
+        movie_poster_url = f'https://tmdb.org{req["poster_path"]}'
+        file_obj = await get_raw_image(movie_poster_url)
+        imdb_link = f'IMDB LINK: https://imdb.com{req["imdb_id"]}\n' if req.get("imdb_id") else ''
+        title_key, release_date_key = get_movie_type(req)
+        
+        caption = f'🎬Title: {req.get(title_key)}\n🎯Released: {req.get(release_date_key)}\nOverview: {req.get("overview")[:200]}\n{imdb_link}Voted: {req.get("vote_average")}\nTagline: {req.get("tagline")}\n'
+        genre = ','.join([items['name'] for items in req.get('genres', [])[:6]])
+
+        if file_obj:
+            await update.effective_user.send_chat_action(action=ChatAction.UPLOAD_PHOTO)
+            await update.effective_message.reply_photo(photo=file_obj, caption=f'{caption} 🎭Genres: {genre}')
+        else:
+            await update.effective_user.send_chat_action(action=ChatAction.TYPING)
+            await update.effective_message.reply_text(text=f'{caption} 🎭Genres: {genre}')
+
+def main() -> None:
+    """Botni serverda ishga tushirish (Webhook yoki Polling)"""
+    application = Application.builder().token(TOKEN).build()
+
+    # Handlerlarni ro'yxatdan o'tkazish
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_pagination, pattern=r"^page-"))
+    application.add_handler(MessageHandler(filters.Regex(r"^/(m|s)_"), movie))
+
+    # Serverga joylashganda Webhook yoqiladi, localda esa oddiy ishlaydi
+    if SERVER_URL:
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"{SERVER_URL}/{TOKEN}"
+        )
+    else:
+        application.run_polling()
 
 if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    main()
